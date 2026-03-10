@@ -28,8 +28,6 @@ def _clean_url(url):
     hostname = parsed.hostname or ""
     if "neon.tech" in hostname and "options" not in params:
         endpoint_id = hostname.split(".")[0]  # e.g. ep-wispy-bird-abc123-pooler
-        if endpoint_id.endswith("-pooler"):
-            endpoint_id = endpoint_id[:-7]  # strip -pooler suffix
         params["options"] = [f"endpoint={endpoint_id}"]
     clean_query = urlencode(params, doseq=True)
     return urlunparse(parsed._replace(query=clean_query))
