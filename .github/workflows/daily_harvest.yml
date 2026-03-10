@@ -1,0 +1,26 @@
+name: Daily Harvest
+
+on:
+  schedule:
+    # Run at 6 AM UTC every day
+    - cron: '0 6 * * *'
+  workflow_dispatch: # Allow manual triggers
+
+jobs:
+  harvest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install requests psycopg2-binary
+
+      - name: Run incremental harvest
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python run_harvest.py --since $(date -d 'yesterday' +%Y-%m-%d)

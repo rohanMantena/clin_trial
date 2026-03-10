@@ -4,26 +4,62 @@ Uses DATABASE_URL environment variable (provided by Railway automatically).
 """
 import os
 import json
+import time
 from datetime import datetime
 
 import psycopg2
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import RealDictCursor, execute_values
 
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
+# Cloud-friendly batch size (Railway free tier crashes at 1000)
+BATCH_DB_SIZE = int(os.environ.get("BATCH_DB_SIZE", "200"))
 
-def get_connection():
-    """Get a database connection."""
-    conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
-    return conn
+
+def _clean_url(url):
+    """Clean DB URL for psycopg2 compatibility (Neon endpoint ID, channel_binding)."""
+    from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+    parsed = urlparse(url)
+    params = parse_qs(parsed.query)
+    # psycopg2 doesn't recognize channel_binding
+    params.pop("channel_binding", None)
+    # Neon requires endpoint ID when libpq lacks SNI support
+    hostname = parsed.hostname or ""
+    if "neon.tech" in hostname and "options" not in params:
+        endpoint_id = hostname.split(".")[0]  # e.g. ep-wispy-bird-abc123-pooler
+        if endpoint_id.endswith("-pooler"):
+            endpoint_id = endpoint_id[:-7]  # strip -pooler suffix
+        params["options"] = [f"endpoint={endpoint_id}"]
+    clean_query = urlencode(params, doseq=True)
+    return urlunparse(parsed._replace(query=clean_query))
+
+
+def get_connection(retries=3):
+    """Get a database connection with retry logic for cloud Postgres."""
+    url = DATABASE_URL
+    if not url:
+        raise RuntimeError("DATABASE_URL environment variable is not set")
+    url = _clean_url(url)
+
+    for attempt in range(retries):
+        try:
+            conn = psycopg2.connect(url, cursor_factory=RealDictCursor)
+            return conn
+        except psycopg2.OperationalError as e:
+            if attempt < retries - 1:
+                wait = 2 ** attempt
+                print(f"  DB connection failed (attempt {attempt + 1}/{retries}), retrying in {wait}s: {e}")
+                time.sleep(wait)
+            else:
+                raise
 
 
 def init_db():
     """Create the studies table if it doesn't exist."""
     conn = get_connection()
     cur = conn.cursor()
-    
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS studies (
             id SERIAL PRIMARY KEY,
@@ -50,7 +86,7 @@ def init_db():
             UNIQUE(source, source_id)
         )
     """)
-    
+
     # Create indexes for common queries
     cur.execute("CREATE INDEX IF NOT EXISTS idx_status ON studies(status)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_phase ON studies(phase)")
@@ -60,7 +96,7 @@ def init_db():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_source_updated ON studies(source_updated_at)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_conditions ON studies USING GIN(conditions)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_interventions ON studies USING GIN(interventions)")
-    
+
     conn.commit()
     cur.close()
     conn.close()
@@ -120,62 +156,70 @@ def upsert_study(cur, study):
         study["source_updated_at"],
     ))
 
-def upsert_batch(studies):
-    """Insert or update a batch of studies using bulk insert."""
-    from psycopg2.extras import execute_values
-    
-    conn = get_connection()
-    cur = conn.cursor()
-    try:
-        values = []
-        for s in studies:
-            values.append((
-                s["source"], s["source_id"], s["source_url"],
-                s["title"], s["official_title"], s["brief_summary"],
-                s["status"], s["phase"], s["study_type"], s["enrollment"],
-                s["start_date"], s["completion_date"],
-                json.dumps(s["conditions"]), json.dumps(s["interventions"]),
-                s["sponsor"], json.dumps(s["locations"]),
-                json.dumps(s["linked_publications"]), s["source_updated_at"],
-            ))
-        
-        execute_values(cur, """
-            INSERT INTO studies (
-                source, source_id, source_url, title, official_title,
-                brief_summary, status, phase, study_type, enrollment,
-                start_date, completion_date, conditions, interventions,
-                sponsor, locations, linked_publications, source_updated_at,
-                updated_at
-            ) VALUES %s
-            ON CONFLICT(source, source_id) DO UPDATE SET
-                title = EXCLUDED.title,
-                official_title = EXCLUDED.official_title,
-                brief_summary = EXCLUDED.brief_summary,
-                status = EXCLUDED.status,
-                phase = EXCLUDED.phase,
-                study_type = EXCLUDED.study_type,
-                enrollment = EXCLUDED.enrollment,
-                start_date = EXCLUDED.start_date,
-                completion_date = EXCLUDED.completion_date,
-                conditions = EXCLUDED.conditions,
-                interventions = EXCLUDED.interventions,
-                sponsor = EXCLUDED.sponsor,
-                locations = EXCLUDED.locations,
-                linked_publications = EXCLUDED.linked_publications,
-                source_updated_at = EXCLUDED.source_updated_at,
-                updated_at = NOW()
-        """, values, template="(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())")
-        
-        conn.commit()
-        return len(studies)
-    except Exception as e:
-        conn.rollback()
-        raise e
-    finally:
-        cur.close()
-        conn.close()
-        
- 
+
+def upsert_batch(studies, retries=3):
+    """Insert or update a batch of studies using bulk insert with retry logic."""
+    for attempt in range(retries):
+        conn = get_connection()
+        cur = conn.cursor()
+        try:
+            values = []
+            for s in studies:
+                values.append((
+                    s["source"], s["source_id"], s["source_url"],
+                    s["title"], s["official_title"], s["brief_summary"],
+                    s["status"], s["phase"], s["study_type"], s["enrollment"],
+                    s["start_date"], s["completion_date"],
+                    json.dumps(s["conditions"]), json.dumps(s["interventions"]),
+                    s["sponsor"], json.dumps(s["locations"]),
+                    json.dumps(s["linked_publications"]), s["source_updated_at"],
+                ))
+
+            execute_values(cur, """
+                INSERT INTO studies (
+                    source, source_id, source_url, title, official_title,
+                    brief_summary, status, phase, study_type, enrollment,
+                    start_date, completion_date, conditions, interventions,
+                    sponsor, locations, linked_publications, source_updated_at,
+                    updated_at
+                ) VALUES %s
+                ON CONFLICT(source, source_id) DO UPDATE SET
+                    title = EXCLUDED.title,
+                    official_title = EXCLUDED.official_title,
+                    brief_summary = EXCLUDED.brief_summary,
+                    status = EXCLUDED.status,
+                    phase = EXCLUDED.phase,
+                    study_type = EXCLUDED.study_type,
+                    enrollment = EXCLUDED.enrollment,
+                    start_date = EXCLUDED.start_date,
+                    completion_date = EXCLUDED.completion_date,
+                    conditions = EXCLUDED.conditions,
+                    interventions = EXCLUDED.interventions,
+                    sponsor = EXCLUDED.sponsor,
+                    locations = EXCLUDED.locations,
+                    linked_publications = EXCLUDED.linked_publications,
+                    source_updated_at = EXCLUDED.source_updated_at,
+                    updated_at = NOW()
+            """, values, template="(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())")
+
+            conn.commit()
+            return len(studies)
+        except psycopg2.OperationalError as e:
+            conn.rollback()
+            if attempt < retries - 1:
+                wait = 2 ** attempt
+                print(f"  DB write failed (attempt {attempt + 1}/{retries}), retrying in {wait}s: {e}")
+                time.sleep(wait)
+            else:
+                raise
+        except Exception as e:
+            conn.rollback()
+            raise e
+        finally:
+            cur.close()
+            conn.close()
+
+
 def get_study_by_source_id(source, source_id):
     """Fetch a single study by source + source_id."""
     conn = get_connection()
@@ -187,7 +231,7 @@ def get_study_by_source_id(source, source_id):
     row = cur.fetchone()
     cur.close()
     conn.close()
-    
+
     if row:
         return _row_to_dict(row)
     return None
@@ -201,10 +245,10 @@ def search_studies(status=None, phase=None, study_type=None, condition=None,
     """
     conn = get_connection()
     cur = conn.cursor()
-    
+
     where_clauses = []
     params = []
-    
+
     if status:
         where_clauses.append("status = %s")
         params.append(status)
@@ -221,15 +265,15 @@ def search_studies(status=None, phase=None, study_type=None, condition=None,
     if updated_since:
         where_clauses.append("updated_at >= %s")
         params.append(updated_since)
-    
+
     where_sql = ""
     if where_clauses:
         where_sql = "WHERE " + " AND ".join(where_clauses)
-    
+
     # Get total count
     cur.execute(f"SELECT COUNT(*) as cnt FROM studies {where_sql}", params)
     total = cur.fetchone()["cnt"]
-    
+
     # Get page of results
     offset = (page - 1) * page_size
     cur.execute(
@@ -237,10 +281,10 @@ def search_studies(status=None, phase=None, study_type=None, condition=None,
         params + [page_size, offset]
     )
     rows = cur.fetchall()
-    
+
     cur.close()
     conn.close()
-    
+
     return [_row_to_dict(r) for r in rows], total
 
 
@@ -248,31 +292,31 @@ def get_stats():
     """Get summary statistics about the database."""
     conn = get_connection()
     cur = conn.cursor()
-    
+
     cur.execute("SELECT COUNT(*) as cnt FROM studies")
     total = cur.fetchone()["cnt"]
-    
+
     cur.execute(
         "SELECT status, COUNT(*) as cnt FROM studies GROUP BY status ORDER BY cnt DESC"
     )
     by_status = cur.fetchall()
-    
+
     cur.execute(
         "SELECT phase, COUNT(*) as cnt FROM studies GROUP BY phase ORDER BY cnt DESC"
     )
     by_phase = cur.fetchall()
-    
+
     cur.execute(
         "SELECT study_type, COUNT(*) as cnt FROM studies GROUP BY study_type ORDER BY cnt DESC"
     )
     by_type = cur.fetchall()
-    
+
     cur.execute("SELECT MAX(updated_at) as latest FROM studies")
     last_updated = cur.fetchone()["latest"]
-    
+
     cur.close()
     conn.close()
-    
+
     return {
         "total_studies": total,
         "by_status": {r["status"]: r["cnt"] for r in by_status},

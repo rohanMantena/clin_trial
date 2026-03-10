@@ -1,12 +1,19 @@
 """
 FastAPI application serving clinical trials data.
 """
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Query, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
 import database
 
-# Initialize database on startup
-database.init_db()
+
+@asynccontextmanager
+async def lifespan(app):
+    """Initialize database on startup."""
+    database.init_db()
+    yield
+
 
 app = FastAPI(
     title="Clinical Trials Aggregator",
@@ -14,6 +21,15 @@ app = FastAPI(
                 "Currently ingesting from ClinicalTrials.gov, designed to support "
                 "multiple registries. Built as an abstraction layer for OpenAlex.",
     version="0.1.0",
+    lifespan=lifespan,
+)
+
+# Allow OpenAlex and other consumers to call this API
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET"],
+    allow_headers=["*"],
 )
 
 
@@ -43,7 +59,7 @@ def list_studies(
 ):
     """
     List and filter clinical trials.
-    
+
     OpenAlex integration: Use `updated_since` to poll for new/changed studies daily.
     Example: /studies?updated_since=2026-03-08T00:00:00
     """
@@ -56,7 +72,7 @@ def list_studies(
         page=page,
         page_size=page_size,
     )
-    
+
     return {
         "meta": {
             "total": total,
@@ -72,7 +88,7 @@ def list_studies(
 def get_study(source: str, source_id: str):
     """
     Get a single study by source and source_id.
-    
+
     Example: /studies/clinicaltrials.gov/NCT04368728
     """
     study = database.get_study_by_source_id(source, source_id)

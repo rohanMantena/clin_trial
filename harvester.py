@@ -37,7 +37,7 @@ def harvest_studies(max_pages=None, page_size=10, since_date=None):
             
         # For incremental daily updates - only fetch recently modified studies
         if since_date:
-            params["filter.lastUpdatePostDate"] = since_date
+            params["filter.advanced"] = f"AREA[LastUpdatePostDate]RANGE[{since_date},MAX]"
         
         # Make the request with retry logic
         study_data = _fetch_with_retry(params)
