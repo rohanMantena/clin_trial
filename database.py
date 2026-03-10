@@ -257,9 +257,11 @@ def search_studies(status=None, phase=None, study_type=None, condition=None,
         where_clauses.append("study_type = %s")
         params.append(study_type)
     if condition:
-        # JSONB containment — checks if the array contains a matching string
-        where_clauses.append("conditions @> %s::jsonb")
-        params.append(json.dumps([condition]))
+        # Substring match across JSONB array elements (case-insensitive)
+        where_clauses.append(
+            "EXISTS (SELECT 1 FROM jsonb_array_elements_text(conditions) AS c WHERE c ILIKE %s)"
+        )
+        params.append(f"%{condition}%")
     if updated_since:
         where_clauses.append("updated_at >= %s")
         params.append(updated_since)
