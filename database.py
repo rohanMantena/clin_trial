@@ -13,9 +13,6 @@ from psycopg2.extras import RealDictCursor, execute_values
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
-# Cloud-friendly batch size (Railway free tier crashes at 1000)
-BATCH_DB_SIZE = int(os.environ.get("BATCH_DB_SIZE", "200"))
-
 
 def _clean_url(url):
     """Clean DB URL for psycopg2 compatibility (Neon endpoint ID, channel_binding)."""
@@ -54,7 +51,7 @@ def get_connection(retries=3):
 
 
 def init_db():
-    """Create the studies table if it doesn't exist."""
+    """Create the studies table and indexes if they don't already exist."""
     conn = get_connection()
     cur = conn.cursor()
 
@@ -73,11 +70,17 @@ def init_db():
             enrollment INTEGER,
             start_date VARCHAR(20),
             completion_date VARCHAR(20),
+            registry_date VARCHAR(20),
             conditions JSONB DEFAULT '[]'::jsonb,
+            mesh_terms JSONB DEFAULT '[]'::jsonb,
             interventions JSONB DEFAULT '[]'::jsonb,
             sponsor TEXT,
+            investigators JSONB DEFAULT '[]'::jsonb,
             locations JSONB DEFAULT '[]'::jsonb,
             linked_publications JSONB DEFAULT '[]'::jsonb,
+            secondary_ids JSONB DEFAULT '[]'::jsonb,
+            eligibility JSONB DEFAULT '{}'::jsonb,
+            has_results BOOLEAN DEFAULT FALSE,
             source_updated_at VARCHAR(30),
             created_at TIMESTAMP DEFAULT NOW(),
             updated_at TIMESTAMP DEFAULT NOW(),
@@ -85,15 +88,19 @@ def init_db():
         )
     """)
 
-    # Create indexes for common queries
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_status ON studies(status)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_phase ON studies(phase)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_study_type ON studies(study_type)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_source ON studies(source)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_updated ON studies(updated_at)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_source_updated ON studies(source_updated_at)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_conditions ON studies USING GIN(conditions)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_interventions ON studies USING GIN(interventions)")
+    # Create indexes for common queries (skip gracefully if storage is full)
+    indexes = [
+        "CREATE INDEX IF NOT EXISTS idx_status ON studies(status)",
+        "CREATE INDEX IF NOT EXISTS idx_source ON studies(source)",
+        "CREATE INDEX IF NOT EXISTS idx_updated ON studies(updated_at)",
+    ]
+    for idx_sql in indexes:
+        try:
+            cur.execute(idx_sql)
+        except psycopg2.errors.DiskFull:
+            conn.rollback()
+            print(f"  Skipping index (storage full): {idx_sql.split('idx_')[1].split(' ')[0]}")
+            break
 
     conn.commit()
     cur.close()
@@ -101,104 +108,67 @@ def init_db():
     print("Database initialized.")
 
 
+# Column list used by both upsert_study and upsert_batch
+_COLUMNS = [
+    "source", "source_id", "source_url", "title", "official_title",
+    "brief_summary", "status", "phase", "study_type", "enrollment",
+    "start_date", "completion_date", "registry_date",
+    "conditions", "mesh_terms", "interventions", "sponsor",
+    "investigators", "locations", "linked_publications",
+    "secondary_ids", "eligibility", "has_results", "source_updated_at",
+]
+
+_JSONB_FIELDS = {
+    "conditions", "mesh_terms", "interventions",
+    "investigators", "locations",
+    "linked_publications", "secondary_ids", "eligibility",
+}
+
+
+def _study_to_values(s):
+    """Convert a study dict to a tuple of values matching _COLUMNS."""
+    vals = []
+    for col in _COLUMNS:
+        v = s.get(col)
+        if col in _JSONB_FIELDS:
+            v = json.dumps(v if v is not None else ({} if col == "eligibility" else []))
+        vals.append(v)
+    return tuple(vals)
+
+
 def upsert_study(cur, study):
-    """
-    Insert or update a study. Uses source + source_id as the unique key.
-    """
-    cur.execute("""
-        INSERT INTO studies (
-            source, source_id, source_url, title, official_title,
-            brief_summary, status, phase, study_type, enrollment,
-            start_date, completion_date, conditions, interventions,
-            sponsor, locations, linked_publications,
-            source_updated_at, updated_at
-        ) VALUES (
-            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-            %s, %s, %s, %s, %s, %s, %s, %s, NOW()
-        )
-        ON CONFLICT(source, source_id) DO UPDATE SET
-            title = EXCLUDED.title,
-            official_title = EXCLUDED.official_title,
-            brief_summary = EXCLUDED.brief_summary,
-            status = EXCLUDED.status,
-            phase = EXCLUDED.phase,
-            study_type = EXCLUDED.study_type,
-            enrollment = EXCLUDED.enrollment,
-            start_date = EXCLUDED.start_date,
-            completion_date = EXCLUDED.completion_date,
-            conditions = EXCLUDED.conditions,
-            interventions = EXCLUDED.interventions,
-            sponsor = EXCLUDED.sponsor,
-            locations = EXCLUDED.locations,
-            linked_publications = EXCLUDED.linked_publications,
-            source_updated_at = EXCLUDED.source_updated_at,
-            updated_at = NOW()
-    """, (
-        study["source"],
-        study["source_id"],
-        study["source_url"],
-        study["title"],
-        study["official_title"],
-        study["brief_summary"],
-        study["status"],
-        study["phase"],
-        study["study_type"],
-        study["enrollment"],
-        study["start_date"],
-        study["completion_date"],
-        json.dumps(study["conditions"]),
-        json.dumps(study["interventions"]),
-        study["sponsor"],
-        json.dumps(study["locations"]),
-        json.dumps(study["linked_publications"]),
-        study["source_updated_at"],
-    ))
+    """Insert or update a study. Uses source + source_id as the unique key."""
+    cols = ", ".join(_COLUMNS + ["updated_at"])
+    placeholders = ", ".join(["%s"] * len(_COLUMNS) + ["NOW()"])
+    update_set = ", ".join(
+        f"{c} = EXCLUDED.{c}" for c in _COLUMNS if c not in ("source", "source_id")
+    ) + ", updated_at = NOW()"
+
+    cur.execute(f"""
+        INSERT INTO studies ({cols}) VALUES ({placeholders})
+        ON CONFLICT(source, source_id) DO UPDATE SET {update_set}
+    """, _study_to_values(study))
 
 
 def upsert_batch(studies, retries=3):
     """Insert or update a batch of studies using bulk insert with retry logic."""
+    cols = ", ".join(_COLUMNS + ["updated_at"])
+    update_set = ", ".join(
+        f"{c} = EXCLUDED.{c}" for c in _COLUMNS if c not in ("source", "source_id")
+    ) + ", updated_at = NOW()"
+    n_cols = len(_COLUMNS)
+    template = "(" + ", ".join(["%s"] * n_cols) + ", NOW())"
+
     for attempt in range(retries):
         conn = get_connection()
         cur = conn.cursor()
         try:
-            values = []
-            for s in studies:
-                values.append((
-                    s["source"], s["source_id"], s["source_url"],
-                    s["title"], s["official_title"], s["brief_summary"],
-                    s["status"], s["phase"], s["study_type"], s["enrollment"],
-                    s["start_date"], s["completion_date"],
-                    json.dumps(s["conditions"]), json.dumps(s["interventions"]),
-                    s["sponsor"], json.dumps(s["locations"]),
-                    json.dumps(s["linked_publications"]), s["source_updated_at"],
-                ))
+            values = [_study_to_values(s) for s in studies]
 
-            execute_values(cur, """
-                INSERT INTO studies (
-                    source, source_id, source_url, title, official_title,
-                    brief_summary, status, phase, study_type, enrollment,
-                    start_date, completion_date, conditions, interventions,
-                    sponsor, locations, linked_publications, source_updated_at,
-                    updated_at
-                ) VALUES %s
-                ON CONFLICT(source, source_id) DO UPDATE SET
-                    title = EXCLUDED.title,
-                    official_title = EXCLUDED.official_title,
-                    brief_summary = EXCLUDED.brief_summary,
-                    status = EXCLUDED.status,
-                    phase = EXCLUDED.phase,
-                    study_type = EXCLUDED.study_type,
-                    enrollment = EXCLUDED.enrollment,
-                    start_date = EXCLUDED.start_date,
-                    completion_date = EXCLUDED.completion_date,
-                    conditions = EXCLUDED.conditions,
-                    interventions = EXCLUDED.interventions,
-                    sponsor = EXCLUDED.sponsor,
-                    locations = EXCLUDED.locations,
-                    linked_publications = EXCLUDED.linked_publications,
-                    source_updated_at = EXCLUDED.source_updated_at,
-                    updated_at = NOW()
-            """, values, template="(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())")
+            execute_values(cur, f"""
+                INSERT INTO studies ({cols}) VALUES %s
+                ON CONFLICT(source, source_id) DO UPDATE SET {update_set}
+            """, values, template=template)
 
             conn.commit()
             return len(studies)
@@ -236,7 +206,7 @@ def get_study_by_source_id(source, source_id):
 
 
 def search_studies(status=None, phase=None, study_type=None, condition=None,
-                   updated_since=None, page=1, page_size=25):
+                   has_results=None, updated_since=None, page=1, page_size=25):
     """
     Search studies with optional filters.
     Returns (studies_list, total_count).
@@ -257,11 +227,13 @@ def search_studies(status=None, phase=None, study_type=None, condition=None,
         where_clauses.append("study_type = %s")
         params.append(study_type)
     if condition:
-        # Substring match across JSONB array elements (case-insensitive)
         where_clauses.append(
             "EXISTS (SELECT 1 FROM jsonb_array_elements_text(conditions) AS c WHERE c ILIKE %s)"
         )
         params.append(f"%{condition}%")
+    if has_results is not None:
+        where_clauses.append("has_results = %s")
+        params.append(has_results)
     if updated_since:
         where_clauses.append("updated_at >= %s")
         params.append(updated_since)
@@ -270,11 +242,9 @@ def search_studies(status=None, phase=None, study_type=None, condition=None,
     if where_clauses:
         where_sql = "WHERE " + " AND ".join(where_clauses)
 
-    # Get total count
     cur.execute(f"SELECT COUNT(*) as cnt FROM studies {where_sql}", params)
     total = cur.fetchone()["cnt"]
 
-    # Get page of results
     offset = (page - 1) * page_size
     cur.execute(
         f"SELECT * FROM studies {where_sql} ORDER BY updated_at DESC LIMIT %s OFFSET %s",
@@ -311,6 +281,9 @@ def get_stats():
     )
     by_type = cur.fetchall()
 
+    cur.execute("SELECT COUNT(*) as cnt FROM studies WHERE has_results = TRUE")
+    with_results = cur.fetchone()["cnt"]
+
     cur.execute("SELECT MAX(updated_at) as latest FROM studies")
     last_updated = cur.fetchone()["latest"]
 
@@ -319,6 +292,7 @@ def get_stats():
 
     return {
         "total_studies": total,
+        "with_results": with_results,
         "by_status": {r["status"]: r["cnt"] for r in by_status},
         "by_phase": {r["phase"]: r["cnt"] for r in by_phase},
         "by_type": {r["study_type"]: r["cnt"] for r in by_type},
@@ -327,14 +301,8 @@ def get_stats():
 
 
 def _row_to_dict(row):
-    """
-    Convert a database row to a clean dict.
-    Postgres with RealDictCursor already returns dicts.
-    JSONB columns are automatically parsed by psycopg2.
-    We just need to handle datetime serialization.
-    """
+    """Convert a database row to a clean dict."""
     d = dict(row)
-    # Convert datetime objects to ISO strings for JSON serialization
     for field in ["created_at", "updated_at"]:
         if d.get(field) and hasattr(d[field], "isoformat"):
             d[field] = d[field].isoformat()
