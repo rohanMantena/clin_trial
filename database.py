@@ -1,6 +1,6 @@
 """
 Database layer for clinical trials — Postgres version for production.
-Uses DATABASE_URL environment variable (provided by Railway automatically).
+Uses DATABASE_URL environment variable for Neon Postgres connection.
 """
 import os
 import json

@@ -26,7 +26,7 @@ The schema uses `source` + `source_id` as a composite key instead of `nct_id`. A
 
 ## Schema
 
-26 columns mapping clinical trial data to concepts OpenAlex already understands:
+27 columns mapping clinical trial data to concepts OpenAlex already understands:
 
 | Field | Type | Maps to OpenAlex |
 |---|---|---|
@@ -38,7 +38,30 @@ The schema uses `source` + `source_id` as a composite key instead of `nct_id`. A
 | `secondary_ids` | JSONB | Cross-registry deduplication |
 | `source` + `source_id` | VARCHAR | Source-agnostic identity |
 
-Additional fields: `title`, `official_title`, `brief_summary`, `status`, `phase`, `study_type`, `enrollment`, `start_date`, `completion_date`, `registry_date`, `interventions`, `locations`, `eligibility` (sex, age range, healthy volunteers), `has_results`, `source_url`, `source_updated_at`, `created_at`, `updated_at`.
+Additional fields: `title`, `official_title`, `brief_summary`, `status`, `phase`, `study_type`, `enrollment`, `start_date`, `completion_date`, `registry_date`, `interventions`, `locations`, `eligibility`, `has_results`, `source_url`, `source_updated_at`, `created_at`, `updated_at`.
+
+### What's excluded and why
+
+ClinicalTrials.gov returns 50+ fields per study. We deliberately excluded fields that don't serve an aggregator's purpose:
+
+| Excluded field | Reason |
+|---|---|
+| `keywords` | Redundant with `conditions` + `mesh_terms`. MeSH is the controlled vocabulary; keywords are free-text duplicates |
+| `collaborators` | Lead `sponsor` is sufficient for institution mapping. Collaborators add noise without clear entity resolution |
+| `eligibility_criteria_text` | Free-text blob often 500+ words per study. We extract only the structured fields (sex, age range, healthy volunteers) into `eligibility` JSONB — keeps rows ~200 bytes vs ~2KB while preserving queryable attributes |
+| `detailed_description` | Often duplicates `brief_summary` at greater length; not useful for discovery |
+| `arms/groups` | Intervention-arm mappings are protocol-level detail beyond what a registry aggregator needs |
+| `outcome_measures` | Clinical endpoint detail, not relevant for study discovery or linking |
+| `study_design_info` | Allocation, masking, etc. — protocol design metadata not needed for OpenAlex's entity model |
+| `ipd_sharing` | Individual patient data sharing plans — regulatory detail |
+
+### Non-obvious inclusion decisions
+
+- **`eligibility`** — Structured JSONB (sex, min/max age, healthy volunteers) instead of the raw criteria text. Preserves the most useful filter dimensions at a fraction of the storage cost.
+- **`secondary_ids`** — Enables cross-registry deduplication when adding EU Clinical Trials Register or ISRCTN as future sources.
+- **`mesh_terms`** — Controlled MeSH vocabulary maps directly to OpenAlex Topics/Concepts, unlike free-text `conditions`.
+- **`linked_publications`** with regex DOI extraction — ClinicalTrials.gov buries DOIs in citation free-text. We extract them for direct cross-linking with OpenAlex Works.
+- **`enrollment`** — Useful for filtering by study size; a common research dimension.
 
 ## API Endpoints
 
